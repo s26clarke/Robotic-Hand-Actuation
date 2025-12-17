@@ -1,0 +1,181 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import serial
+import time
+
+# -------------------------------
+# Serial & Servo setup
+# -------------------------------
+SERIAL_PORT = 'COM4'  # Update if needed
+BAUD_RATE = 9600
+arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+time.sleep(2)  # wait for Arduino reset
+
+def send_servo_angles(front_angle, rear_angle):
+    """Send two servo angles to Arduino"""
+    cmd = f"{int(front_angle)},{int(rear_angle)}\n"
+    arduino.write(cmd.encode())
+    try:
+        response = arduino.readline().decode().strip()
+        if "," in response:
+            f_str, r_str = response.split(",")
+            return int(f_str), int(r_str)
+    except:
+        pass
+    return None
+
+# -------------------------------
+# MediaPipe hand tracking
+# -------------------------------
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_drawing = mp.solutions.drawing_utils
+
+# -------------------------------
+# Finger indices & vectors
+# -------------------------------
+FINGER_IDX = {
+    "thumb": [1, 2, 3, 4],
+    "index": [5, 6, 7, 8],
+    "middle": [9, 10, 11, 12],
+    "ring": [13, 14, 15, 16],
+    "pinky": [17, 18, 19, 20]
+}
+
+def signed_angle_3d(v1, v2, normal):
+    """Signed angle in 3D between vectors around a normal"""
+    angle = np.arccos(np.clip(np.dot(v1, v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)), -1, 1))
+    sign = np.sign(np.dot(normal, np.cross(v1, v2)))
+    return np.degrees(angle) * sign
+
+def finger_angles(landmarks, finger_indices):
+    """Compute th1, th2, th3 for a finger"""
+    mcp = np.array([landmarks[finger_indices[0]].x,
+                    landmarks[finger_indices[0]].y,
+                    landmarks[finger_indices[0]].z])
+    pip = np.array([landmarks[finger_indices[1]].x,
+                    landmarks[finger_indices[1]].y,
+                    landmarks[finger_indices[1]].z])
+    dip = np.array([landmarks[finger_indices[2]].x,
+                    landmarks[finger_indices[2]].y,
+                    landmarks[finger_indices[2]].z])
+    tip = np.array([landmarks[finger_indices[3]].x,
+                    landmarks[finger_indices[3]].y,
+                    landmarks[finger_indices[3]].z])
+
+    # Segment vectors
+    v1 = pip - mcp
+    v2 = dip - pip
+    v3 = tip - dip
+
+    # Hand plane normal
+    wrist = np.array([landmarks[0].x, landmarks[0].y, landmarks[0].z])
+    pinky_mcp = np.array([landmarks[17].x, landmarks[17].y, landmarks[17].z])
+    hand_normal = np.cross(pinky_mcp - wrist, mcp - wrist)
+    hand_normal /= np.linalg.norm(hand_normal)
+
+    # θ2 and θ3 (PIP, DIP)
+    theta2 = signed_angle_3d(v1, v2, hand_normal)
+    theta3 = signed_angle_3d(v2, v3, hand_normal)
+
+    # θ1 (rear motor) = base bend, MCP→TIP vs MCP→PIP
+    theta1 = signed_angle_3d(v1, v1+v2+v3, hand_normal)  # approximate base extension
+
+    return theta1, theta2, theta3
+
+# -------------------------------
+# Motor polynomials
+# -------------------------------
+coeff_theta1 = [3.09991231e-14, 4.55686223e-11, 2.99381347e-08, 1.15797734e-05,
+                2.92089285e-03, 5.02158069e-01, 5.96007492e+01, 4.82312329e+03,
+                2.54719477e+05, 7.92866197e+06, 1.10472513e+08]
+
+coeff_theta2 = [-3.19261719e-14, -1.42221266e-11, -2.67052147e-09, -2.73973106e-07,
+ -1.66026272e-05, -5.96547405e-04, -1.19073341e-02, -1.07173400e-01,
+ -1.52271201e-01, -1.87794529e+00,  1.56939668e+01]
+
+coeff_theta3 = [3.26238696e-14, 1.39462717e-11, 2.53893681e-09, 2.56961257e-07,
+ 1.58384237e-05, 6.12745890e-04, 1.47901913e-02, 2.13331494e-01,
+ 1.62851995e+00, 3.28227616e+00, 2.39132010e+00]
+
+# -------------------------------
+# Capture loop
+# -------------------------------
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    raise IOError("Cannot open webcam")
+
+prev_front = None
+prev_rear = None
+alpha_smooth = 0.2
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+
+    if results.multi_hand_landmarks:
+        hand_landmarks = results.multi_hand_landmarks[0]
+        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+        theta1, theta2, theta3 = finger_angles(hand_landmarks.landmark, FINGER_IDX['index'])
+
+        # -------------------------------
+        # Rear motor (theta1)
+        # -------------------------------
+        theta1_d = np.clip(-180-theta1*3, -180, -90)
+        rear_motor = np.polyval(coeff_theta1, theta1_d)
+        rear_motor = np.clip(155-rear_motor, 2, 155)
+
+        #rear_motor = 45
+        if prev_rear is not None:
+            rear_motor = prev_rear*(1-alpha_smooth) + rear_motor*alpha_smooth
+        prev_rear = rear_motor
+
+        # -------------------------------
+        # Front motor (theta2, theta3)
+        # -------------------------------
+        theta2_d = theta2
+        theta3_d = theta3
+        if theta2_d > 0: theta2_d *= -1
+        if theta3_d > 0: theta3_d *= -1
+        if theta2_d < -65: theta2_d = -90
+        if theta3_d < -65: theta3_d = -90
+
+        angle2 = np.polyval(coeff_theta2 , theta2_d)
+        angle3 = np.polyval(coeff_theta3, theta3_d)
+
+        if theta2_d > -15 or theta3_d > -15:
+            front_motor = angle3
+        else:
+            front_motor = angle2
+        front_motor = np.clip(front_motor, 2, 155)
+        if prev_front is not None:
+            front_motor = prev_front*(1-alpha_smooth) + front_motor*alpha_smooth
+        prev_front = front_motor
+
+        # Send both motors
+        send_servo_angles(front_motor, rear_motor)
+
+        cv2.putText(frame,
+                    f"TH1:{-180-theta1*3:.1f} TH2:{theta2:.1f} TH3:{theta3:.1f} Front:{front_motor:.1f} Rear:{rear_motor:.1f}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    else:
+        cv2.putText(frame, "No hand detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    cv2.imshow("Index Finger Control", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+arduino.close()
+cv2.destroyAllWindows()
